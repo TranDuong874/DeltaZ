@@ -248,9 +248,18 @@ def convert_scene_new(mvsnet_root, depth_scene_path, scan_name, out_root):
 # MAIN
 ###############################################
 if __name__ == "__main__":
+    import argparse
 
-    mvsnet_root = "/home/tranduong/DeltaZ/model/dataset/mvs_training/dtu"
+    parser = argparse.ArgumentParser(description="Convert DTU MVSNet data to DeltaZ format")
+    parser.add_argument("--mvsnet_root", type=str, required=False,
+                        default="/home/tranduong/DeltaZ/model/dataset/mvs_training/dtu",
+                        help="Path to DTU MVSNet root directory")
+    parser.add_argument("--out_root", type=str, required=False,
+                        default="./dtu_train_ready",
+                        help="Output directory for converted dataset")
+    args = parser.parse_args()
+    mvsnet_root = args.mvsnet_root
     depths_root = os.path.join(mvsnet_root, "Depths")
-    out_root = "./dtu_train_ready"
+    out_root = args.out_root
     
     convert_all(mvsnet_root, depths_root, out_root)
