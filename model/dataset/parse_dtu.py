@@ -77,171 +77,157 @@ def load_pairs(pair_path):
 
 
 ###############################################
-# PROCESS ONE SCENE
-###############################################
-def convert_scene(mvsnet_scene_path, rectified_scene_path, out_root):
-    scene_name = os.path.basename(mvsnet_scene_path.rstrip("/"))
-    print(f"\n=== Processing {scene_name} ===")
-
-    img_dir = os.path.join(mvsnet_scene_path, "images")
-    cam_dir = os.path.join(mvsnet_scene_path, "cams")
-    pair_path = os.path.join(mvsnet_scene_path, "pair.txt")
-
-    depth_dir = os.path.join(rectified_scene_path, "depths")
-
-    # check depth folder
-    if not os.path.exists(depth_dir):
-        print(f"[WARNING] No depth folder: {depth_dir}")
-        return
-
-    # output dirs
-    out_scene = os.path.join(out_root, scene_name)
-    os.makedirs(os.path.join(out_scene, "images"), exist_ok=True)
-    os.makedirs(os.path.join(out_scene, "depths"), exist_ok=True)
-    os.makedirs(os.path.join(out_scene, "intrinsics"), exist_ok=True)
-    os.makedirs(os.path.join(out_scene, "extrinsics"), exist_ok=True)
-
-    # neighbors
-    neighbors = load_pairs(pair_path)
-    with open(os.path.join(out_scene, "neighbors.json"), "w") as f:
-        json.dump(neighbors, f, indent=2)
-
-    # image IDs (00000000.jpg → 0)
-    img_ids = sorted([int(f.split(".")[0]) for f in os.listdir(img_dir)])
-
-    for idx in img_ids:
-        rgb_path = os.path.join(img_dir, f"{idx:08d}.jpg")
-        cam_path = os.path.join(cam_dir, f"{idx:08d}_cam.txt")
-        depth_path = os.path.join(depth_dir, f"depth_{idx:04d}.pfm")
-
-        if not os.path.exists(depth_path):
-            print(f"[MISSING DEPTH] {depth_path}")
-            continue
-
-        # RGB
-        rgb = np.array(Image.open(rgb_path))
-        imageio.imwrite(os.path.join(out_scene, "images", f"{idx:04d}.png"), rgb)
-
-        # Depth
-        depth = read_pfm(depth_path)
-        np.save(os.path.join(out_scene, "depths", f"{idx:04d}.npy"), depth)
-
-        # Camera
-        R, t, K = load_cam_file(cam_path)
-        np.save(os.path.join(out_scene, "intrinsics",  f"{idx:04d}.npy"), K)
-        np.save(os.path.join(out_scene, "extrinsics", f"{idx:04d}.npy"), np.hstack([R, t.reshape(3,1)]))
-
-        print(f"  OK frame {idx}")
-
-    print(f"✔ Done: {scene_name}")
-
-
-###############################################
 # PROCESS ALL SCENES
 ###############################################
-def convert_all(mvsnet_root, depths_root, out_root):
+def convert_all(mvsnet_root, out_root):
     """
     mvsnet_root:    DTU preprocessed root with structure:
                     ├── Cameras/
                     ├── Depths/
                     └── Rectified/
-    depths_root:    Depths root containing scan1_train/, scan2_train/, etc.
     out_root:       Output GT dataset
     """
+    
+    cameras_dir = os.path.join(mvsnet_root, "Cameras")
+    depths_root = os.path.join(mvsnet_root, "Depths")
+    rectified_root = os.path.join(mvsnet_root, "Rectified")
+
+    # Verify all required directories exist
+    if not os.path.exists(cameras_dir):
+        print(f"[ERROR] Cameras folder not found: {cameras_dir}")
+        return
+    if not os.path.exists(depths_root):
+        print(f"[ERROR] Depths folder not found: {depths_root}")
+        return
+    if not os.path.exists(rectified_root):
+        print(f"[ERROR] Rectified folder not found: {rectified_root}")
+        return
 
     # Find all scan_train folders in depths_root
     scan_dirs = sorted([d for d in os.listdir(depths_root) if d.endswith("_train")])
     
-    print(f"Found {len(scan_dirs)} scan folders in {depths_root}")
+    print(f"Found {len(scan_dirs)} scan folders")
 
     for scan_dir in scan_dirs:
         # Extract scan number (e.g., "scan1_train" → "scan1")
         scan_name = scan_dir.replace("_train", "")
         
         depth_path = os.path.join(depths_root, scan_dir)
+        rectified_path = os.path.join(rectified_root, scan_dir)
 
         if not os.path.exists(depth_path):
             print(f"[WARNING] No depth folder: {depth_path}")
             continue
+        
+        if not os.path.exists(rectified_path):
+            print(f"[WARNING] No rectified folder: {rectified_path}")
+            continue
 
-        convert_scene_new(mvsnet_root, depth_path, scan_name, out_root)
+        convert_scene(cameras_dir, depth_path, rectified_path, scan_name, out_root)
 
 
 ###############################################
-# PROCESS ONE SCENE (UPDATED FOR NEW STRUCTURE)
+# PROCESS ONE SCENE
 ###############################################
-def convert_scene_new(mvsnet_root, depth_scene_path, scan_name, out_root):
+def convert_scene(cameras_dir, depth_scene_path, rectified_scene_path, scan_name, out_root):
     """
-    mvsnet_root:        DTU root with Cameras/, Depths/, etc.
+    cameras_dir:        Path to Cameras directory with *_cam.txt files
     depth_scene_path:   Path to scan1_train/, scan2_train/, etc. in Depths folder
+    rectified_scene_path: Path to scan1_train/, scan2_train/, etc. in Rectified folder
     scan_name:          e.g., 'scan1', 'scan2'
     out_root:           Output directory
     """
     print(f"\n=== Processing {scan_name} ===")
 
-    cam_dir = os.path.join(mvsnet_root, "Cameras")
-    depth_dir = depth_scene_path
-
     # Check if required directories exist
-    if not os.path.exists(cam_dir):
-        print(f"[WARNING] No camera folder: {cam_dir}")
+    if not os.path.exists(cameras_dir):
+        print(f"[WARNING] No camera folder: {cameras_dir}")
         return
     
-    if not os.path.exists(depth_dir):
-        print(f"[WARNING] No depth folder: {depth_dir}")
+    if not os.path.exists(depth_scene_path):
+        print(f"[WARNING] No depth folder: {depth_scene_path}")
+        return
+    
+    if not os.path.exists(rectified_scene_path):
+        print(f"[WARNING] No rectified folder: {rectified_scene_path}")
         return
 
     # Output dirs
     out_scene = os.path.join(out_root, scan_name)
+    os.makedirs(os.path.join(out_scene, "rgb"), exist_ok=True)
     os.makedirs(os.path.join(out_scene, "depths"), exist_ok=True)
     os.makedirs(os.path.join(out_scene, "intrinsics"), exist_ok=True)
     os.makedirs(os.path.join(out_scene, "extrinsics"), exist_ok=True)
 
     # Load depth files to determine which cameras to process
-    depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith(".pfm")])
+    depth_files = sorted([f for f in os.listdir(depth_scene_path) if f.startswith("depth_map_") and f.endswith(".pfm")])
     
     if not depth_files:
-        print(f"[WARNING] No depth files found in {depth_dir}")
+        print(f"[WARNING] No depth files found in {depth_scene_path}")
         return
     
     print(f"Found {len(depth_files)} depth files")
 
     # Process each depth file
+    success_count = 0
     for depth_file in depth_files:
-        # Extract frame index from depth filename (e.g., "depth_map_0000.pfm" or "depth_0000.pfm" → 0000)
-        parts = depth_file.split("_")
-        if "depth" in parts[0]:
-            # Format: depth_map_0000.pfm or depth_0000.pfm
-            frame_str = parts[-1].split(".")[0]
-        else:
-            frame_str = parts[1].split(".")[0]
-        
+        # Extract frame index from depth filename (e.g., "depth_map_0000.pfm" → 0000)
+        frame_str = depth_file.replace("depth_map_", "").replace(".pfm", "")
         frame_idx = int(frame_str)
         
-        cam_path = os.path.join(cam_dir, f"{frame_idx:08d}_cam.txt")
-        depth_path = os.path.join(depth_dir, depth_file)
+        cam_path = os.path.join(cameras_dir, f"{frame_idx:08d}_cam.txt")
+        depth_path = os.path.join(depth_scene_path, depth_file)
+        
+        # Try to find the corresponding RGB image in Rectified folder
+        # Pattern: rect_XXX_Y_r5000.png where XXX is the camera number
+        # Camera indices are 0-based (0-48) but rect files are 1-based (001-049)
+        # So we need to add 1 to the frame_idx to match
+        rgb_camera_id = frame_idx + 1
+        rgb_found = False
+        rgb_path = None
+        
+        rectified_files = [f for f in os.listdir(rectified_scene_path) if f.endswith(".png")]
+        
+        for rect_file in rectified_files:
+            # Parse rect_001_0_r5000.png → camera_id=001, subset_id=0
+            parts = rect_file.replace(".png", "").replace("_r5000", "").split("_")
+            if len(parts) >= 2:
+                camera_id = int(parts[1])
+                if camera_id == rgb_camera_id:
+                    rgb_path = os.path.join(rectified_scene_path, rect_file)
+                    rgb_found = True
+                    break
 
         if not os.path.exists(cam_path):
-            print(f"[MISSING CAMERA] {cam_path}")
+            print(f"  [SKIP] {frame_idx:04d} - missing camera file")
+            continue
+        
+        if not rgb_found:
+            print(f"  [SKIP] {frame_idx:04d} - missing RGB image")
             continue
 
-        # Camera file exists, process depth
+        # All files exist, process
         try:
-            # Load Depth
+            # Load and save RGB
+            rgb = np.array(Image.open(rgb_path))
+            imageio.imwrite(os.path.join(out_scene, "rgb", f"{frame_idx:04d}.png"), rgb)
+
+            # Load and save Depth
             depth = read_pfm(depth_path)
             np.save(os.path.join(out_scene, "depths", f"{frame_idx:04d}.npy"), depth)
 
-            # Camera
+            # Load and save Camera (intrinsics and extrinsics)
             R, t, K = load_cam_file(cam_path)
             np.save(os.path.join(out_scene, "intrinsics", f"{frame_idx:04d}.npy"), K)
             np.save(os.path.join(out_scene, "extrinsics", f"{frame_idx:04d}.npy"), np.hstack([R, t.reshape(3, 1)]))
 
-            print(f"  ✓ frame {frame_idx}")
+            print(f"  OK {frame_idx:04d}")
+            success_count += 1
         except Exception as e:
-            print(f"  ✗ Error processing frame {frame_idx}: {e}")
+            print(f"  FAIL {frame_idx:04d} - Error: {str(e)}")
             continue
 
-    print(f"✔ Done: {scan_name}")
+    print(f"Done: {scan_name} ({success_count}/{len(depth_files)} frames processed)")
 
 
 ###############################################
@@ -252,14 +238,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Convert DTU MVSNet data to DeltaZ format")
     parser.add_argument("--mvsnet_root", type=str, required=False,
-                        default="/home/tranduong/DeltaZ/model/dataset/mvs_training/dtu",
+                        default=os.path.join(os.path.dirname(__file__), "mvs_training", "dtu"),
                         help="Path to DTU MVSNet root directory")
     parser.add_argument("--out_root", type=str, required=False,
-                        default="./dtu_train_ready",
+                        default=os.path.join(os.path.dirname(__file__), "..", "..", "dtu_train_ready"),
                         help="Output directory for converted dataset")
     args = parser.parse_args()
-    mvsnet_root = args.mvsnet_root
-    depths_root = os.path.join(mvsnet_root, "Depths")
-    out_root = args.out_root
+    mvsnet_root = os.path.abspath(args.mvsnet_root)
+    out_root = os.path.abspath(args.out_root)
     
-    convert_all(mvsnet_root, depths_root, out_root)
+    print(f"Processing DTU data from: {mvsnet_root}")
+    print(f"Output directory: {out_root}\n")
+    
+    convert_all(mvsnet_root, out_root)

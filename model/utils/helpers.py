@@ -130,7 +130,11 @@ def backproject_depth(depth, ray_dirs, K=None, u=None, v=None):
         # Use precomputed ray directions
         if ray_dirs.dim() == 3:
             ray_dirs = ray_dirs.unsqueeze(0)  # Add batch dim
-        points_3d = depth * ray_dirs  # (B, 3, H, W)
+        # Ensure depth is (B, 1, H, W) for proper broadcasting
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        # Broadcast: (B, 1, H, W) * (B, 3, H, W) = (B, 3, H, W)
+        points_3d = depth * ray_dirs
     else:
         # Compute from intrinsics
         assert K is not None, "Either ray_dirs or K must be provided"

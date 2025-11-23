@@ -1,2 +1,4 @@
 model/dataset/dtu_train_ready
 model/dataset/mvs_training
+.venv/
+dtu_train_ready/

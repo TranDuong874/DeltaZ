@@ -145,9 +145,11 @@ class DeltaZTrainer:
         
         # Get ray directions for reference view
         ray_dirs_i, _ = get_ray_dirs_mask(H, W, K_i, device=self.device)
+        # Handle case where function returns (W, H, 3) instead of (H, W, 3)
+        if ray_dirs_i.shape[0] == W and ray_dirs_i.shape[1] == H:
+            ray_dirs_i = ray_dirs_i.permute(1, 0, 2)  # swap to (H, W, 3)
         ray_dirs_i = ray_dirs_i.unsqueeze(0).expand(B, -1, -1, -1)  # (B, H, W, 3)
         ray_dirs_i = ray_dirs_i.permute(0, 3, 1, 2)  # (B, 3, H, W)
-        
         # Forward pass: predict delta_z
         delta_z = self.model(torch.zeros_like(depth_gt).unsqueeze(1))  # (B, 1, H, W)
         delta_z = delta_z.squeeze(1)  # (B, H, W)
@@ -183,57 +185,65 @@ class DeltaZTrainer:
         
         # Multi-view consistency (if V > 1)
         if V > 1:
-            # Use first neighbor as second view
-            depth_j = data['depth'][:, 1]  # (B, H, W)
-            K_j = data['intrinsics'][:, 1]  # (B, 3, 3)
-            R_j = data['R'][:, 1]  # (B, 3, 3)
-            t_j = data['t'][:, 1]  # (B, 3)
-            
-            # Backproject reference view
-            ray_dirs_i_flat = ray_dirs_i.permute(0, 2, 3, 1)  # (B, H, W, 3)
-            points_i = backproject_depth(
-                depth_pred.unsqueeze(1),  # (B, 1, H, W)
-                ray_dirs_i_flat,
-                K_i
-            )  # (B, 3, H, W)
-            
-            # Transform to world then to view j
-            points_i_flat = points_i.reshape(B, 3, -1).transpose(1, 2)  # (B, N, 3)
-            
-            R_i_inv = R_i.transpose(-1, -2)
-            t_i_world = -torch.matmul(R_i_inv, t_i.unsqueeze(-1)).squeeze(-1)
-            
-            # This would need proper transform_points implementation
-            # For now, approximate with reprojection
-            
             try:
-                points_world = points_i_flat @ R_i_inv.transpose(-1, -2) + t_i_world.unsqueeze(1)
-                points_j = points_world @ R_j.transpose(-1, -2) + t_j.unsqueeze(1)
+                # Use first neighbor as second view
+                depth_j = data['depth'][:, 1]  # (B, H, W)
+                K_j = data['intrinsics'][:, 1]  # (B, 3, 3)
+                R_j = data['R'][:, 1]  # (B, 3, 3)
+                t_j = data['t'][:, 1]  # (B, 3)
                 
-                # Project to image j
-                uv_j = torch.matmul(K_j.unsqueeze(1), points_j.transpose(-1, -2)).transpose(-1, -2)
-                uv_j = uv_j[..., :2] / (uv_j[..., 2:3] + 1e-8)  # Perspective division
+                # Backproject reference view
+                points_i = backproject_depth(
+                    depth_pred.unsqueeze(1),  # (B, 1, H, W)
+                    ray_dirs_i,  # (B, 3, H, W)
+                    K_i
+                )  # (B, 3, H, W)
                 
-                # Normalize to [-1, 1]
+                # Flatten points: (B, 3, H*W)
+                points_i_flat = points_i.reshape(B, 3, -1)  # (B, 3, H*W)
+                
+                # Transform from view i to world frame
+                # world_point = R_i^T @ (point_i - t_i)
+                R_i_inv = R_i.transpose(-1, -2)  # (B, 3, 3)
+                # Reshape for batched matmul: (B, 3, 3) @ (B, 3, N) = (B, 3, N)
+                points_world = torch.matmul(R_i_inv, points_i_flat)  # (B, 3, H*W)
+                points_world = points_world + t_i.unsqueeze(-1)  # (B, 3, H*W)
+                
+                # Transform from world to view j frame
+                # view_j_point = R_j @ point_world + t_j
+                points_j = torch.matmul(R_j, points_world)  # (B, 3, H*W)
+                points_j = points_j + t_j.unsqueeze(-1)  # (B, 3, H*W)
+                
+                # Project to image j using K_j
+                # uv = K @ p = (B, 3, 3) @ (B, 3, N) = (B, 3, N)
+                uv_j = torch.matmul(K_j, points_j)  # (B, 3, H*W)
+                uv_j = uv_j.transpose(1, 2)  # (B, H*W, 3)
+                uv_j = uv_j[..., :2] / (uv_j[..., 2:3] + 1e-8)  # Perspective division -> (B, N, 2)
+                
+                # Normalize to [-1, 1] for grid_sample
                 u_norm = (uv_j[..., 0] / (W - 1)) * 2 - 1
                 v_norm = (uv_j[..., 1] / (H - 1)) * 2 - 1
-                grid = torch.stack([u_norm, v_norm], dim=-1).reshape(B, -1, 1, 2)
+                grid = torch.stack([u_norm, v_norm], dim=-1).reshape(B, -1, 1, 2)  # (B, N, 1, 2)
                 
                 # Sample depth from view j
                 depth_j_sampled = torch.nn.functional.grid_sample(
-                    depth_j.unsqueeze(1),
+                    depth_j.unsqueeze(1),  # (B, 1, H, W)
                     grid,
                     mode='bilinear',
                     padding_mode='zeros',
                     align_corners=True
-                ).squeeze(-1).squeeze(1)  # (B, N)
+                )  # (B, 1, N, 1)
+                depth_j_sampled = depth_j_sampled.squeeze(1).squeeze(-1)  # (B, N)
                 
-                # Compare
-                depth_j_pred = points_j[..., 2]
+                # Compare depths
+                # points_j is (B, 3, N), z coordinate is at index 2
+                depth_j_pred = points_j[:, 2, :]  # (B, N)
                 diff_mv = (depth_j_sampled - depth_j_pred).abs().mean()
-                loss_dict['loss_mv'] = (0.5 * diff_mv).item()
+                loss_dict['loss_mv'] = (0.01 * diff_mv).item()  # Reduced weight for multi-view loss
             except Exception as e:
                 print(f"[WARNING] Multi-view loss failed: {e}")
+                import traceback
+                traceback.print_exc()
                 loss_dict['loss_mv'] = 0.0
         
         # Total loss
@@ -244,10 +254,12 @@ class DeltaZTrainer:
             loss_smooth
         )
         
-        if 'loss_mv' in loss_dict:
-            total_loss += 0.5 * loss_dict['loss_mv']
+        # Add multi-view loss if computed
+        loss_mv_tensor = None
+        if V > 1 and 'loss_mv' in loss_dict and loss_dict['loss_mv'] > 0:
+            loss_mv_tensor = diff_mv * 0.01
+            total_loss = total_loss + loss_mv_tensor
         
-        # Backward pass
         self.optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -390,13 +402,13 @@ class DeltaZTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description="Train DeltaZ depth refinement model")
-    parser.add_argument('--data-root', type=str, default='./model/dataset/dtu_train_ready',
+    parser.add_argument('--data-root', type=str, default='./dtu_train_ready',
                        help='Path to dtu_train_ready dataset')
-    parser.add_argument('--batch-size', type=int, default=4,
+    parser.add_argument('--batch-size', type=int, default=2,
                        help='Batch size')
     parser.add_argument('--num-views', type=int, default=2,
                        help='Number of views per sample')
-    parser.add_argument('--num-epochs', type=int, default=50,
+    parser.add_argument('--num-epochs', type=int, default=1,
                        help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate')
@@ -410,16 +422,33 @@ def main():
                        help='Resume from checkpoint')
     parser.add_argument('--val-split', type=float, default=0.1,
                        help='Validation split')
+    parser.add_argument('--test-mode', action='store_true',
+                       help='Test mode: run 1 batch with 2 samples only')
     
     args = parser.parse_args()
     
     device = torch.device(args.device)
     print(f"Using device: {device}")
     
+    # Determine data root
+    data_root = args.data_root
+    if not os.path.isabs(data_root):
+        # If relative path, try to find dtu_train_ready in DeltaZ root
+        if not os.path.exists(data_root):
+            possible_root = os.path.join(os.path.dirname(__file__), data_root)
+            if os.path.exists(possible_root):
+                data_root = possible_root
+    
+    print(f"Data root: {data_root}")
+    
+    if not os.path.exists(data_root):
+        print(f"ERROR: Data root does not exist: {data_root}")
+        return
+    
     # Create dataloaders
     print("Creating dataloaders...")
     train_loader, val_loader = create_dataloaders(
-        data_root=args.data_root,
+        data_root=data_root,
         batch_size=args.batch_size,
         num_views=args.num_views,
         val_split=args.val_split,
@@ -444,6 +473,32 @@ def main():
     # Resume from checkpoint if provided
     if args.resume:
         trainer.load_checkpoint(args.resume)
+    
+    # Test mode: run single batch
+    if args.test_mode:
+        print("\n=== TEST MODE: Running 1 batch ===")
+        batch_count = 0
+        try:
+            for batch in train_loader:
+                batch_count += 1
+                print(f"\nBatch {batch_count}:")
+                print(f"  Depth shape: {batch['depth'].shape}")
+                print(f"  Intrinsics shape: {batch['intrinsics'].shape}")
+                print(f"  Extrinsics shape: {batch['extrinsics'].shape}")
+                print(f"  Scene: {batch['scene']}")
+                
+                # Run single training step
+                losses = trainer.train_step(batch)
+                print(f"  Losses: {losses}")
+                
+                if batch_count >= 1:
+                    break
+        except Exception as e:
+            print(f"ERROR during test batch: {e}")
+            import traceback
+            traceback.print_exc()
+        print("Test complete!\n")
+        return
     
     # Train
     print("Starting training...")
