@@ -90,14 +90,12 @@ class DeltaZTrainer:
         self.global_step = 0
         self.epoch = 0
     
-    def _prepare_batch(self, batch: Dict) -> Tuple[Dict, Dict]:
+    def _prepare_batch(self, batch: Dict) -> Dict:
         """
         Prepare batch data for training.
         
         Returns:
-            (data, extrinsics_dict) where:
-                - data: Dict with depth, intrinsics, etc.
-                - extrinsics_dict: Dict with R, t for each view
+            Dict with all batch data and parsed extrinsics
         """
         # Batch structure:
         # depth: (B, num_views, H, W)
@@ -132,16 +130,74 @@ class DeltaZTrainer:
         """
         Single training step.
         
-        Returns:
-            Dictionary of loss values
+        When use_noisy=True:
+        - batch['depth']: noisy initial depth estimate
+        - batch['depth_gt']: ground truth depth
+        - Model predicts: delta_z = depth_gt - depth_noisy
         """
-        data = self._prepare_batch(batch)
-        B, V, H, W = data['B'], data['V'], data['H'], data['W']
+        B, V, H, W = batch['depth'].shape
         
-        depth_gt = data['depth'][:, 0]  # Reference view depth: (B, H, W)
-        K_i = data['intrinsics'][:, 0]  # Reference intrinsics: (B, 3, 3)
-        R_i = data['R'][:, 0]  # Reference rotation: (B, 3, 3)
-        t_i = data['t'][:, 0]  # Reference translation: (B, 3)
+        # Get ground truth depth
+        # If depth_gt is available, use it; otherwise use first view depth
+        if 'depth_gt' in batch:
+            depth_gt = batch['depth_gt'][:, 0]  # (B, H, W)
+            depth_initial = batch['depth'][:, 0]  # Noisy initial depth
+        else:
+            depth_gt = batch['depth'][:, 0]  # (B, H, W) - GT (first view)
+            depth_initial = batch['depth'][:, 0]  # Use same for both
+        
+        # Model predicts delta correction
+        delta_z = self.model(depth_initial.unsqueeze(1))  # Input: (B, 1, H, W)
+        delta_z = delta_z.squeeze(1)  # Output: (B, H, W)
+        
+        # Refined depth
+        depth_refined = depth_initial + delta_z  # Apply correction
+        
+        # Loss 1: Depth refinement (L1 loss)
+        loss_depth = torch.nn.functional.l1_loss(depth_refined, depth_gt)
+        
+        # Loss 2: Delta improvement (encourage meaningful corrections)
+        # Penalize if delta doesn't reduce error
+        error_before = (depth_initial - depth_gt).abs()
+        error_after = (depth_refined - depth_gt).abs()
+        improvement = (error_before - error_after).clamp(min=0)  # Only positive improvements
+        loss_delta = -improvement.mean()  # Negative because we want to maximize improvement
+        
+        # Loss 3: Magnitude regularization (don't over-correct)
+        loss_mag = 0.01 * delta_z.abs().mean()
+        
+        # Loss 4: Smoothness (spatial consistency)
+        dx = delta_z[:, :, :-1] - delta_z[:, :, 1:]
+        dy = delta_z[:, :-1, :] - delta_z[:, 1:, :]
+        loss_smooth = 0.01 * (dx.abs().mean() + dy.abs().mean())
+        
+        loss_dict = {
+            'loss_depth': loss_depth.item(),
+            'loss_delta': loss_delta.item(),
+            'loss_mag': loss_mag.item(),
+            'loss_smooth': loss_smooth.item(),
+        }
+        
+        # Loss 5: Multi-view consistency (if V > 1) - SKIP FOR NOW (too complex)
+        # Multi-view losses need more careful handling of camera transforms
+        loss_dict['loss_mv'] = 0.0
+        
+        # Total loss
+        total_loss = (
+            loss_depth +
+            0.5 * loss_delta +
+            loss_mag +
+            loss_smooth
+        )
+        
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        
+        loss_dict['total'] = total_loss.item()
+        
+        return loss_dict
         
         # Get ray directions for reference view
         ray_dirs_i, _ = get_ray_dirs_mask(H, W, K_i, device=self.device)
@@ -293,9 +349,11 @@ class DeltaZTrainer:
                 for key, val in loss_dict.items():
                     self.writer.add_scalar(f'train/{key}', val, self.global_step)
                 
-                if (batch_idx + 1) % 10 == 0:
-                    print(f"Epoch {self.epoch} Batch {batch_idx + 1}: "
-                          f"loss={loss_dict['total']:.4f}")
+                if (batch_idx + 1) % 5 == 0 or batch_idx == 0:
+                    print(f"Epoch {self.epoch} Batch {batch_idx + 1:4d}: "
+                          f"loss={loss_dict['total']:8.4f} "
+                          f"(depth={loss_dict.get('loss_depth', 0):7.4f}, "
+                          f"delta={loss_dict.get('loss_delta', 0):7.4f})")
                 
             except Exception as e:
                 print(f"[ERROR] Batch {batch_idx} failed: {e}")
@@ -308,22 +366,49 @@ class DeltaZTrainer:
         return epoch_losses
     
     def validate(self) -> Dict[str, float]:
-        """Validate on validation set."""
+        """Validate on validation set with depth improvement metrics."""
         self.model.eval()
         
         val_losses = {}
         num_batches = 0
         
+        # Depth improvement metrics
+        total_depth_mae_before = 0.0  # Mean Absolute Error before refinement
+        total_depth_mae_after = 0.0   # Mean Absolute Error after refinement
+        total_depth_mse_before = 0.0
+        total_depth_mse_after = 0.0
+        
         with torch.no_grad():
             for batch in self.val_loader:
                 try:
-                    loss_dict = self.train_step(batch)
+                    B, V, H, W = batch['depth'].shape
                     
-                    # Accumulate losses
-                    for key, val in loss_dict.items():
-                        if key not in val_losses:
-                            val_losses[key] = 0.0
-                        val_losses[key] += val
+                    # Use noisy/GT pair if available, otherwise use GT only
+                    if 'depth_gt' in batch:
+                        depth_noisy = batch['depth'][:, 0]
+                        depth_gt = batch['depth_gt'][:, 0]
+                    else:
+                        # Fallback: use GT as both (won't improve)
+                        depth_noisy = batch['depth'][:, 0]
+                        depth_gt = batch['depth'][:, 0]
+                    
+                    # Get model's delta prediction
+                    delta_z = self.model(depth_noisy.unsqueeze(1))
+                    delta_z = delta_z.squeeze(1)
+                    
+                    # Refined depth
+                    depth_refined = depth_noisy + delta_z
+                    
+                    # Compute depth errors
+                    mae_before = (depth_noisy - depth_gt).abs().mean().item()
+                    mae_after = (depth_refined - depth_gt).abs().mean().item()
+                    mse_before = ((depth_noisy - depth_gt) ** 2).mean().item()
+                    mse_after = ((depth_refined - depth_gt) ** 2).mean().item()
+                    
+                    total_depth_mae_before += mae_before
+                    total_depth_mae_after += mae_after
+                    total_depth_mse_before += mse_before
+                    total_depth_mse_after += mse_after
                     
                     num_batches += 1
                 except Exception as e:
@@ -333,6 +418,28 @@ class DeltaZTrainer:
         # Average losses
         for key in val_losses:
             val_losses[key] /= max(num_batches, 1)
+        
+        # Average depth metrics
+        num_batches = max(num_batches, 1)
+        depth_mae_before = total_depth_mae_before / num_batches
+        depth_mae_after = total_depth_mae_after / num_batches
+        depth_mse_before = total_depth_mse_before / num_batches
+        depth_mse_after = total_depth_mse_after / num_batches
+        
+        # Improvement metrics
+        mae_improvement = (depth_mae_before - depth_mae_after) / (depth_mae_before + 1e-8) * 100
+        mse_improvement = (depth_mse_before - depth_mse_after) / (depth_mse_before + 1e-8) * 100
+        
+        # Add depth metrics to val_losses
+        val_losses['depth_mae_before'] = depth_mae_before
+        val_losses['depth_mae_after'] = depth_mae_after
+        val_losses['depth_mae_improvement_pct'] = mae_improvement
+        val_losses['depth_mse_before'] = depth_mse_before
+        val_losses['depth_mse_after'] = depth_mse_after
+        val_losses['depth_mse_improvement_pct'] = mse_improvement
+        
+        # Compute total validation loss (average of mae improvement)
+        val_losses['total'] = -mae_improvement  # Negative because we want to minimize this
         
         # Log to tensorboard
         for key, val in val_losses.items():
@@ -349,7 +456,8 @@ class DeltaZTrainer:
             val_every: Validate every N epochs
             save_every: Save checkpoint every N epochs
         """
-        best_loss = float('inf')
+        best_val_loss = float('inf')
+        best_mae_improvement = -float('inf')
         
         for epoch in range(num_epochs):
             self.epoch = epoch
@@ -359,16 +467,32 @@ class DeltaZTrainer:
             epoch_time = time.time() - start_time
             
             print(f"\nEpoch {epoch} finished in {epoch_time:.2f}s")
-            print(f"Train losses: {train_losses}")
+            print(f"Train - total_loss: {train_losses['total']:.4f}, "
+                  f"depth: {train_losses['loss_depth']:.4f}, "
+                  f"delta: {train_losses['loss_delta']:.4f}")
             
             # Validation
             if (epoch + 1) % val_every == 0:
                 val_losses = self.validate()
-                print(f"Val losses: {val_losses}")
+                print(f"\nValidation Results:")
+                print(f"  Total Loss:             {val_losses['total']:.4f}")
+                print(f"  Depth MAE Before:       {val_losses['depth_mae_before']:.6f}")
+                print(f"  Depth MAE After:        {val_losses['depth_mae_after']:.6f}")
+                print(f"  Depth MAE Improvement:  {val_losses['depth_mae_improvement_pct']:.2f}%")
+                print(f"  Depth MSE Before:       {val_losses['depth_mse_before']:.6f}")
+                print(f"  Depth MSE After:        {val_losses['depth_mse_after']:.6f}")
+                print(f"  Depth MSE Improvement:  {val_losses['depth_mse_improvement_pct']:.2f}%")
                 
-                if val_losses['total'] < best_loss:
-                    best_loss = val_losses['total']
-                    self.save_checkpoint(tag='best')
+                # Track best models
+                if val_losses['total'] < best_val_loss:
+                    best_val_loss = val_losses['total']
+                    self.save_checkpoint(tag='best_loss')
+                    print(f"  >> New best loss: {best_val_loss:.4f}")
+                
+                if val_losses['depth_mae_improvement_pct'] > best_mae_improvement:
+                    best_mae_improvement = val_losses['depth_mae_improvement_pct']
+                    self.save_checkpoint(tag='best_mae_improvement')
+                    print(f"  >> New best MAE improvement: {best_mae_improvement:.2f}%")
             
             # Save checkpoint
             if (epoch + 1) % save_every == 0:
@@ -424,22 +548,31 @@ def main():
                        help='Validation split')
     parser.add_argument('--test-mode', action='store_true',
                        help='Test mode: run 1 batch with 2 samples only')
+    parser.add_argument('--use-noisy', action='store_true',
+                       help='Use noisy inputs with GT targets (from dtu_train_noisy/)')
     
     args = parser.parse_args()
     
     device = torch.device(args.device)
     print(f"Using device: {device}")
     
-    # Determine data root
-    data_root = args.data_root
-    if not os.path.isabs(data_root):
-        # If relative path, try to find dtu_train_ready in DeltaZ root
-        if not os.path.exists(data_root):
-            possible_root = os.path.join(os.path.dirname(__file__), data_root)
-            if os.path.exists(possible_root):
-                data_root = possible_root
-    
-    print(f"Data root: {data_root}")
+    # Determine data root and GT path
+    if args.use_noisy:
+        data_root = './dtu_train_noisy'
+        gt_path = './dtu_train_ready'
+        print(f"Using noisy training mode:")
+        print(f"  Input (noisy): {data_root}")
+        print(f"  Target (GT):   {gt_path}")
+    else:
+        data_root = args.data_root
+        gt_path = None
+        if not os.path.isabs(data_root):
+            # If relative path, try to find dtu_train_ready in DeltaZ root
+            if not os.path.exists(data_root):
+                possible_root = os.path.join(os.path.dirname(__file__), data_root)
+                if os.path.exists(possible_root):
+                    data_root = possible_root
+        print(f"Data root: {data_root}")
     
     if not os.path.exists(data_root):
         print(f"ERROR: Data root does not exist: {data_root}")
@@ -453,6 +586,8 @@ def main():
         num_views=args.num_views,
         val_split=args.val_split,
         device=device,
+        use_noisy=args.use_noisy,
+        gt_path=gt_path,
     )
     
     # Create model

@@ -11,6 +11,10 @@ class DTUSceneDataset(Dataset):
     """
     Load a single DTU scene's depth, intrinsics, and extrinsics.
     Returns (depth, intrinsic, extrinsic) tuples for frame pairs.
+    
+    Can load either:
+    - GT depths only (from dtu_train_ready/)
+    - Noisy + GT pairs (from dtu_train_noisy/ + dtu_train_ready/)
     """
     
     def __init__(
@@ -19,6 +23,8 @@ class DTUSceneDataset(Dataset):
         num_views: int = 2,
         max_frames: Optional[int] = None,
         device: torch.device = torch.device("cpu"),
+        use_noisy: bool = False,
+        gt_path: Optional[str] = None,
     ):
         """
         Args:
@@ -26,10 +32,14 @@ class DTUSceneDataset(Dataset):
             num_views: Number of views to sample per batch item
             max_frames: If set, only use first N frames from this scene
             device: torch device for loading data
+            use_noisy: If True, load noisy depths as input and GT as target
+            gt_path: Path to GT dataset (required if use_noisy=True)
         """
         self.scene_path = scene_path
         self.num_views = num_views
         self.device = device
+        self.use_noisy = use_noisy
+        self.gt_path = gt_path
         
         # Load available frame indices
         depth_dir = os.path.join(scene_path, "depths")
@@ -38,7 +48,22 @@ class DTUSceneDataset(Dataset):
         
         # Get frame IDs from depth files
         depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith(".npy")])
-        self.frame_ids = [int(f.split(".")[0]) for f in depth_files]
+        
+        # Filter: if using noisy, only use base frames (without _v suffix)
+        if use_noisy:
+            base_frames = set()
+            for f in depth_files:
+                # Extract base frame ID (without variant suffix)
+                parts = f.split('_')
+                if len(parts) >= 2 and parts[-1].startswith('v'):
+                    # Has variant suffix, keep base
+                    base_frames.add('_'.join(parts[:-1]))
+                else:
+                    # No variant, keep as is
+                    base_frames.add(f.split('.')[0])
+            self.frame_ids = sorted([int(f) for f in base_frames])
+        else:
+            self.frame_ids = [int(f.split(".")[0]) for f in depth_files]
         
         if max_frames is not None:
             self.frame_ids = self.frame_ids[:max_frames]
@@ -52,10 +77,16 @@ class DTUSceneDataset(Dataset):
         self.intrinsics_dir = intrinsics_dir
         self.extrinsics_dir = extrinsics_dir
         
+        # For GT loading (if using noisy)
+        if use_noisy and gt_path:
+            scene_name = os.path.basename(scene_path)
+            self.gt_depth_dir = os.path.join(gt_path, scene_name, "depths")
+        
         # Cache for loaded data
         self._depth_cache = {}
         self._intrinsics_cache = {}
         self._extrinsics_cache = {}
+        self._gt_depth_cache = {}
     
     def __len__(self) -> int:
         """Number of possible view pairs in this scene."""
@@ -63,11 +94,31 @@ class DTUSceneDataset(Dataset):
         return len(self.frame_ids)
     
     def _load_depth(self, frame_id: int) -> np.ndarray:
-        """Load depth map for a frame."""
+        """Load depth map for a frame (noisy if use_noisy=True)."""
         if frame_id not in self._depth_cache:
-            path = os.path.join(self.depth_dir, f"{frame_id:04d}.npy")
-            self._depth_cache[frame_id] = np.load(path)
+            if self.use_noisy:
+                # Load noisy variant (use variant 0 consistently)
+                import glob
+                noisy_files = glob.glob(os.path.join(self.depth_dir, f"{frame_id:04d}_v*.npy"))
+                if noisy_files:
+                    # Sort and pick first variant for consistency
+                    noisy_files = sorted(noisy_files)
+                    selected_file = noisy_files[0]  # Always use variant 0
+                else:
+                    # Fallback to non-variant
+                    selected_file = os.path.join(self.depth_dir, f"{frame_id:04d}.npy")
+            else:
+                selected_file = os.path.join(self.depth_dir, f"{frame_id:04d}.npy")
+            
+            self._depth_cache[frame_id] = np.load(selected_file)
         return self._depth_cache[frame_id]
+    
+    def _load_gt_depth(self, frame_id: int) -> np.ndarray:
+        """Load ground truth depth (only if use_noisy=True)."""
+        if frame_id not in self._gt_depth_cache:
+            path = os.path.join(self.gt_depth_dir, f"{frame_id:04d}.npy")
+            self._gt_depth_cache[frame_id] = np.load(path)
+        return self._gt_depth_cache[frame_id]
     
     def _load_intrinsics(self, frame_id: int) -> np.ndarray:
         """Load intrinsic matrix for a frame."""
@@ -93,7 +144,8 @@ class DTUSceneDataset(Dataset):
         Returns:
             Dictionary with keys:
                 - 'frame_ids': (num_views,) frame indices
-                - 'depth': (num_views, H, W) depth maps
+                - 'depth': (num_views, H, W) depth maps (noisy if use_noisy=True)
+                - 'depth_gt': (num_views, H, W) ground truth depths (if use_noisy=True)
                 - 'intrinsics': (num_views, 3, 3) intrinsic matrices
                 - 'extrinsics': (num_views, 3, 4) extrinsic matrices [R|t]
         """
@@ -113,6 +165,7 @@ class DTUSceneDataset(Dataset):
         
         # Load data for all frames
         depths = []
+        depths_gt = []
         intrinsics = []
         extrinsics = []
         
@@ -122,6 +175,12 @@ class DTUSceneDataset(Dataset):
             R, t = self._load_extrinsics(frame_id)
             
             depths.append(torch.from_numpy(depth).float().unsqueeze(0))  # (1, H, W)
+            
+            # Load GT depth if using noisy
+            if self.use_noisy:
+                depth_gt = self._load_gt_depth(frame_id)
+                depths_gt.append(torch.from_numpy(depth_gt).float().unsqueeze(0))
+            
             intrinsics.append(torch.from_numpy(K).float())  # (3, 3)
             extrinsics.append(torch.from_numpy(np.hstack([R, t.reshape(3, 1)])).float())  # (3, 4)
         
@@ -131,13 +190,21 @@ class DTUSceneDataset(Dataset):
         intrinsics = torch.stack(intrinsics, dim=0)  # (num_views, 3, 3)
         extrinsics = torch.stack(extrinsics, dim=0)  # (num_views, 3, 4)
         
-        return {
+        result = {
             'frame_ids': torch.tensor(frame_ids),
             'depth': depths.to(self.device),
             'intrinsics': intrinsics.to(self.device),
             'extrinsics': extrinsics.to(self.device),
             'scene': os.path.basename(self.scene_path),
         }
+        
+        # Add GT depths if using noisy
+        if self.use_noisy and depths_gt:
+            depths_gt = torch.stack(depths_gt, dim=0)
+            depths_gt = depths_gt.squeeze(1)
+            result['depth_gt'] = depths_gt.to(self.device)
+        
+        return result
 
 
 class SameScenesDataLoader:
@@ -167,10 +234,12 @@ class SameScenesDataLoader:
         num_workers: int = 0,
         device: torch.device = torch.device("cpu"),
         scans: Optional[List[str]] = None,
+        use_noisy: bool = False,
+        gt_path: Optional[str] = None,
     ):
         """
         Args:
-            root_dir: Path to dtu_train_ready directory
+            root_dir: Path to dtu_train_ready or dtu_train_noisy directory
             batch_size: How many samples per batch
             num_views: Number of views per sample
             max_frames_per_scene: Limit frames per scene (None = use all)
@@ -179,12 +248,16 @@ class SameScenesDataLoader:
             device: torch device
             scans: List of specific scan names to use (e.g., ['scan1', 'scan2'])
                   If None, auto-discover all scans
+            use_noisy: If True, load from dtu_train_noisy with GT from gt_path
+            gt_path: Path to GT dataset (required if use_noisy=True)
         """
         self.root_dir = root_dir
         self.batch_size = batch_size
         self.num_views = num_views
         self.num_workers = num_workers
         self.device = device
+        self.use_noisy = use_noisy
+        self.gt_path = gt_path
         
         # Discover scenes
         if scans is None:
@@ -202,6 +275,8 @@ class SameScenesDataLoader:
                     num_views=num_views,
                     max_frames=max_frames_per_scene,
                     device=device,
+                    use_noisy=getattr(self, 'use_noisy', False),
+                    gt_path=getattr(self, 'gt_path', None),
                 )
                 self.scene_datasets[scene_name] = dataset
             except Exception as e:
@@ -276,17 +351,21 @@ def create_dataloaders(
     val_split: float = 0.1,
     max_frames_per_scene: Optional[int] = None,
     device: torch.device = torch.device("cpu"),
+    use_noisy: bool = False,
+    gt_path: Optional[str] = None,
 ) -> Tuple[SameScenesDataLoader, SameScenesDataLoader]:
     """
-    Create train/val dataloaders from dtu_train_ready directory.
+    Create train/val dataloaders from dtu_train_ready or dtu_train_noisy directory.
     
     Args:
-        data_root: Path to dtu_train_ready
+        data_root: Path to dtu_train_ready or dtu_train_noisy
         batch_size: Batch size
         num_views: Views per sample
         val_split: Fraction of scenes for validation (e.g., 0.1 = 10%)
         max_frames_per_scene: Limit frames per scene
         device: torch device
+        use_noisy: If True, load noisy inputs with GT targets
+        gt_path: Path to GT dataset (required if use_noisy=True)
     
     Returns:
         (train_loader, val_loader)
@@ -308,6 +387,8 @@ def create_dataloaders(
         shuffle=True,
         device=device,
         scans=train_scans,
+        use_noisy=use_noisy,
+        gt_path=gt_path,
     )
     
     val_loader = SameScenesDataLoader(
@@ -318,6 +399,8 @@ def create_dataloaders(
         shuffle=False,
         device=device,
         scans=val_scans,
+        use_noisy=use_noisy,
+        gt_path=gt_path,
     )
     
     return train_loader, val_loader
